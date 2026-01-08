@@ -42,3 +42,25 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# videos
+*.webm
+*.mkv
+*.flv
+*.mov
+*.wmv
+*.mpg
+*.mpeg
+*.3gp
+*.m4v
+*.ts
+*.vob
+*.rmvb
+*.ogv
+*.f4v
+*.divx
+*.xvid
+*.asf
+*.rm
+mp4chops/
+mp4
