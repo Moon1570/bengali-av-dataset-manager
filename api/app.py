@@ -3,7 +3,7 @@ Hybrid API - Job Queue + Manual Student Review
 Combines automated processing with human quality control
 """
 
-from flask import Flask, request, jsonify, session
+from flask import Flask, request, jsonify, session, send_from_directory
 from flask_cors import CORS
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -35,6 +35,9 @@ app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(32))
 # Database
 DATABASE_URL = os.getenv('DATABASE_URL')
 
+# Storage path
+STORAGE_PATH = Path(__file__).parent.parent / 'data' / 'storage'
+
 # ============================================================================
 # REAL PROCESSING - Background Worker Management
 # ============================================================================
@@ -42,7 +45,7 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 # In-memory status tracking (for production, use Redis)
 processing_status = {}
 
-def run_worker_background(video_id, youtube_url, preset, student_id):
+def run_worker_background(video_id, youtube_url, preset, transcription_model, student_id):
     """Run worker script in background thread"""
     try:
         processing_status[video_id] = {
@@ -55,47 +58,104 @@ def run_worker_background(video_id, youtube_url, preset, student_id):
         
         # Path to worker script
         worker_script = Path(__file__).parent.parent / 'worker' / 'process_video.py'
+        # Use virtual environment Python
+        venv_python = Path(__file__).parent.parent / '.venv' / 'bin' / 'python'
         
         cmd = [
-            'python3',
+            str(venv_python),
             str(worker_script),
             video_id,
             youtube_url,
-            preset
+            preset,
+            transcription_model
         ]
         
         logger.info(f"🎬 Running worker for {video_id}: {' '.join(cmd)}")
         
         # Update status
-        processing_status[video_id]['logs'].append(f'📥 Downloading from YouTube...')
+        processing_status[video_id]['logs'].append(f'📥 Starting worker script...')
         
-        # Run worker script
-        result = subprocess.run(
+        # Run worker script with real-time log streaming
+        process = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=3600,  # 1 hour timeout
+            bufsize=1,
+            universal_newlines=True,
             cwd=Path(__file__).parent.parent / 'worker'
         )
         
-        if result.returncode == 0:
-            # Parse results from stdout
+        # Stream logs in real-time
+        output_lines = []
+        for line in process.stdout:
+            line = line.rstrip()
+            if line:
+                logger.info(f"[Worker] {line}")
+                output_lines.append(line)
+                
+                # Update logs in processing_status (keep last 100 lines to avoid memory issues)
+                processing_status[video_id]['logs'] = (['🚀 Starting processing...'] + output_lines)[-100:]
+                
+                # Update progress based on log content
+                if 'Step 1/4' in line or 'Downloading' in line:
+                    processing_status[video_id]['progress'] = 10
+                elif 'Step 2/4' in line or 'Processing with Docker' in line:
+                    processing_status[video_id]['progress'] = 30
+                elif 'Docker' in line and 'started' in line:
+                    processing_status[video_id]['progress'] = 35
+                elif 'Step 3/4' in line or 'Collecting results' in line:
+                    processing_status[video_id]['progress'] = 85
+                elif 'Step 4/4' in line or 'Uploading' in line:
+                    processing_status[video_id]['progress'] = 95
+        
+        # Wait for process to complete
+        return_code = process.wait(timeout=10800)
+        
+        if return_code == 0:
+            # Parse JSON results from output
             try:
-                results = json.loads(result.stdout)
-                processing_status[video_id] = {
-                    'status': 'completed',
-                    'progress': 100,
-                    'logs': processing_status[video_id]['logs'] + ['✅ Processing complete!'],
-                    'results': results,
-                    'error': None
-                }
-                logger.info(f"✅ Processing completed: {video_id}")
+                # Try to find JSON object in output (could span multiple lines)
+                results = None
                 
-                # Submit results to database
-                submit_processing_results(video_id, results)
+                # Look for lines containing JSON object
+                json_start = -1
+                json_end = -1
+                brace_count = 0
                 
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse worker output: {result.stdout}")
+                for i, line in enumerate(output_lines):
+                    if '{' in line and json_start == -1:
+                        json_start = i
+                        brace_count = line.count('{') - line.count('}')
+                    elif json_start != -1:
+                        brace_count += line.count('{') - line.count('}')
+                        if brace_count == 0:
+                            json_end = i
+                            break
+                
+                if json_start != -1 and json_end != -1:
+                    # Join the JSON lines and parse
+                    json_text = '\n'.join(output_lines[json_start:json_end+1])
+                    results = json.loads(json_text)
+                    logger.info(f"✅ Parsed results: {json.dumps(results, indent=2)}")
+                
+                if results:
+                    processing_status[video_id] = {
+                        'status': 'completed',
+                        'progress': 100,
+                        'logs': processing_status[video_id]['logs'] + ['✅ Processing complete!'],
+                        'results': results,
+                        'error': None
+                    }
+                    logger.info(f"✅ Processing completed: {video_id}")
+                    
+                    # Submit results to database
+                    submit_processing_results(video_id, results)
+                else:
+                    raise ValueError("No JSON results found in output")
+                
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(f"Failed to parse worker output: {e}")
                 processing_status[video_id] = {
                     'status': 'failed',
                     'progress': 0,
@@ -104,7 +164,7 @@ def run_worker_background(video_id, youtube_url, preset, student_id):
                     'error': f'Invalid output from worker: {str(e)}'
                 }
         else:
-            error_msg = result.stderr or result.stdout or 'Unknown error'
+            error_msg = '\n'.join(output_lines[-20:]) if output_lines else 'Unknown error'
             processing_status[video_id] = {
                 'status': 'failed',
                 'progress': 0,
@@ -120,7 +180,7 @@ def run_worker_background(video_id, youtube_url, preset, student_id):
             'progress': 0,
             'logs': processing_status[video_id]['logs'],
             'results': None,
-            'error': 'Processing timeout after 1 hour'
+            'error': 'Processing timeout after 3 hours'
         }
         logger.error(f"⏱️ Timeout: {video_id}")
         
@@ -303,7 +363,7 @@ def get_current_user():
 
 @app.route('/api/videos/next', methods=['GET'])
 def get_next_video():
-    """Get next available video with preview"""
+    """Get next available videos with preview - returns batch of 5 videos"""
     if 'student_id' not in session:
         return jsonify({'error': 'Not logged in'}), 401
     
@@ -311,36 +371,93 @@ def get_next_video():
     cur = conn.cursor()
     
     try:
-        # Get next video from priority queue
+        student_id = session['student_id']
+        
+        # Get next 5 videos from priority queue, excluding videos this student has interacted with
         cur.execute("""
             SELECT 
-                video_id,
-                youtube_url,
-                title,
-                duration_seconds,
-                speaker_id,
-                speaker_name,
-                domain,
-                times_rejected,
-                times_processed,
-                queued_at
-            FROM pending_videos_queue
-            LIMIT 1
-        """)
+                pv.video_id,
+                pv.youtube_url,
+                pv.title,
+                pv.duration_seconds,
+                pv.speaker_id,
+                pv.speaker_name,
+                pv.domain,
+                pv.times_rejected,
+                pv.times_processed,
+                pv.queued_at
+            FROM pending_videos_queue pv
+            WHERE NOT EXISTS (
+                SELECT 1 FROM processing_jobs pj
+                WHERE pj.video_id = pv.video_id
+                AND pj.assigned_to = %s
+            )
+            LIMIT 5
+        """, (student_id,))
         
-        video = cur.fetchone()
+        videos = cur.fetchall()
         
-        if not video:
+        if not videos:
             return jsonify({'message': 'No videos available in queue'}), 404
         
         return jsonify({
-            'video': video,
-            'estimated_time_minutes': 15 + (video['duration_seconds'] or 0) // 60,
+            'videos': videos,
+            'count': len(videos),
+            'estimated_time_minutes': 15 + (videos[0]['duration_seconds'] or 0) // 60,
             'presets': [
                 {'value': 'strict', 'label': 'Strict', 'description': 'Highest quality (sync>8.0, face>95%)'},
                 {'value': 'balanced', 'label': 'Balanced', 'description': 'Good quality (sync>6.5, face>90%) - Default'},
                 {'value': 'lenient', 'label': 'Lenient', 'description': 'Lower threshold (sync>5.0, face>80%)'}
             ]
+        })
+        
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/videos/short', methods=['GET'])
+def get_short_videos():
+    """Get short videos for quick testing"""
+    if 'student_id' not in session:
+        return jsonify({'error': 'Not logged in'}), 401
+    
+    conn = get_db()
+    cur = conn.cursor()
+    
+    try:
+        student_id = session['student_id']
+        max_duration = int(request.args.get('max_duration', 120))  # Default 2 minutes
+        
+        # Get short videos from priority queue
+        cur.execute("""
+            SELECT 
+                pv.video_id,
+                pv.youtube_url,
+                pv.title,
+                pv.duration_seconds,
+                pv.speaker_id,
+                pv.speaker_name,
+                pv.domain
+            FROM pending_videos_queue pv
+            WHERE pv.duration_seconds > 0 
+            AND pv.duration_seconds <= %s
+            AND NOT EXISTS (
+                SELECT 1 FROM processing_jobs pj
+                WHERE pj.video_id = pv.video_id
+                AND pj.assigned_to = %s
+            )
+            ORDER BY pv.duration_seconds ASC
+            LIMIT 10
+        """, (max_duration, student_id))
+        
+        videos = cur.fetchall()
+        
+        if not videos:
+            return jsonify({'message': f'No videos under {max_duration}s available'}), 404
+        
+        return jsonify({
+            'videos': videos,
+            'count': len(videos)
         })
         
     finally:
@@ -400,6 +517,52 @@ def claim_video(video_id):
         
     except Exception as e:
         conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/videos/<video_id>/skip', methods=['POST'])
+def skip_video(video_id):
+    """Skip/release video back to queue for others to claim"""
+    if 'student_id' not in session:
+        return jsonify({'error': 'Not logged in'}), 401
+    
+    student_id = session['student_id']
+    
+    conn = get_db()
+    cur = conn.cursor()
+    
+    try:
+        # Release the video back to pending status
+        cur.execute("""
+            UPDATE processing_jobs
+            SET status = 'pending',
+                assigned_to = NULL,
+                assigned_at = NULL
+            WHERE video_id = %s
+            AND assigned_to = %s
+            AND status IN ('claimed', 'processing')
+        """, (video_id, student_id))
+        
+        # Clear worker's current video
+        cur.execute("""
+            UPDATE workers
+            SET current_video_id = NULL,
+                last_active = NOW()
+            WHERE worker_id = %s
+            AND current_video_id = %s
+        """, (student_id, video_id))
+        
+        conn.commit()
+        
+        return jsonify({
+            'message': 'Video skipped and released back to queue'
+        })
+        
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to skip video {video_id}: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
         cur.close()
@@ -915,9 +1078,10 @@ def process_real(video_id):
     student_id = session['student_id']
     data = request.json
     preset = data.get('preset', 'balanced')
+    transcription_model = data.get('transcription_model', 'google')
     youtube_url = data.get('youtube_url')
     
-    logger.info(f"🎬 Processing request: {video_id} by {student_id}")
+    logger.info(f"🎬 Processing request: {video_id} by {student_id} (preset: {preset}, transcription: {transcription_model})")
     
     # Check if already processing
     if video_id in processing_status and processing_status[video_id]['status'] == 'processing':
@@ -926,7 +1090,7 @@ def process_real(video_id):
     # Start background thread
     thread = threading.Thread(
         target=run_worker_background,
-        args=(video_id, youtube_url, preset, student_id)
+        args=(video_id, youtube_url, preset, transcription_model, student_id)
     )
     thread.daemon = True
     thread.start()
@@ -956,6 +1120,139 @@ def get_processing_status(video_id):
     logger.debug(f"📊 Status check for {video_id}: {status['status']}")
     
     return jsonify(status)
+
+@app.route('/api/videos/<video_id>/check-processed', methods=['GET'])
+def check_video_processed(video_id):
+    """Check if video is already processed in database and processed.json"""
+    if 'student_id' not in session:
+        return jsonify({'error': 'Not logged in'}), 401
+    
+    try:
+        # Check database for processing records
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        cur.execute("""
+            SELECT pj.job_id, pj.status, pj.created_at, pj.completed_at,
+                   pr.chunks_created, pr.chunks_passed_sync, pr.usable_duration_seconds
+            FROM processing_jobs pj
+            LEFT JOIN processing_results pr ON pj.job_id = pr.job_id
+            WHERE pj.video_id = %s
+            ORDER BY pj.created_at DESC
+            LIMIT 1
+        """, (video_id,))
+        
+        db_record = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        # Check processed.json in outputs directory
+        script_dir = Path(__file__).parent.parent
+        outputs_dir = script_dir / 'data' / 'outputs'
+        processed_json_path = outputs_dir / 'processed.json'
+        
+        processed_json_exists = False
+        processed_json_data = None
+        
+        if processed_json_path.exists():
+            try:
+                with open(processed_json_path, 'r') as f:
+                    processed_data = json.load(f)
+                    if video_id in processed_data:
+                        processed_json_exists = True
+                        processed_json_data = processed_data[video_id]
+            except Exception as e:
+                logger.warning(f"Could not read processed.json: {e}")
+        
+        return jsonify({
+            'video_id': video_id,
+            'database': {
+                'exists': db_record is not None,
+                'status': db_record['status'] if db_record else None,
+                'chunks_created': db_record['chunks_created'] if db_record else None,
+                'chunks_passed': db_record['chunks_passed_sync'] if db_record else None,
+                'completed_at': db_record['completed_at'].isoformat() if db_record and db_record['completed_at'] else None
+            },
+            'processed_json': {
+                'exists': processed_json_exists,
+                'chunks': processed_json_data['chunks'] if processed_json_data else None,
+                'timestamps': processed_json_data.get('timestamps') if processed_json_data else None
+            },
+            'already_processed': db_record is not None or processed_json_exists
+        })
+        
+    except Exception as e:
+        logger.error(f"Error checking processed status: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/videos/<video_id>/chunks', methods=['GET'])
+def get_video_chunks(video_id):
+    """Get list of processed chunks for review"""
+    if 'student_id' not in session:
+        return jsonify({'error': 'Not logged in'}), 401
+    
+    try:
+        # Get storage path from processing status or database
+        storage_path = None
+        if video_id in processing_status and processing_status[video_id].get('results'):
+            storage_path = processing_status[video_id]['results'].get('storage_path')
+        
+        if not storage_path:
+            return jsonify({'error': 'No processed chunks found'}), 404
+        
+        # Build chunk information
+        storage_dir = Path(storage_path)
+        chunks = []
+        
+        # Look for video files in video_normal directory
+        video_normal_dir = storage_dir / 'video_normal'
+        if video_normal_dir.exists():
+            for video_file in sorted(video_normal_dir.glob('*.mp4')):
+                chunk_name = video_file.stem
+                
+                # Build chunk info
+                chunk_info = {
+                    'chunk_id': chunk_name,
+                    'video_url': f'/storage/{video_id}/{video_file.name}',
+                    'has_audio': (storage_dir / 'audio' / f'{chunk_name}.wav').exists(),
+                    'has_cropped': (storage_dir / 'video_cropped' / f'{chunk_name}.mp4').exists(),
+                    'has_bbox': (storage_dir / 'video_bbox' / f'{chunk_name}_with_bboxes.mp4').exists(),
+                }
+                
+                # Check for transcription
+                transcription_file = storage_dir / 'google_transcription' / f'{chunk_name}.txt'
+                if transcription_file.exists():
+                    try:
+                        with open(transcription_file, 'r', encoding='utf-8') as f:
+                            chunk_info['transcription'] = f.read().strip()
+                    except Exception:
+                        chunk_info['transcription'] = None
+                
+                chunks.append(chunk_info)
+        
+        return jsonify({
+            'chunks': chunks,
+            'total': len(chunks),
+            'storage_path': str(storage_path)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting chunks: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================================
+# STATIC FILE SERVING
+# ============================================================================
+
+@app.route('/storage/<video_id>/<filename>')
+def serve_storage_file(video_id, filename):
+    """Serve storage files (videos, audio) for chunk review"""
+    try:
+        storage_dir = STORAGE_PATH / video_id / 'video_normal'
+        return send_from_directory(storage_dir, filename)
+    except Exception as e:
+        logger.error(f"Error serving file: {e}")
+        return jsonify({'error': 'File not found'}), 404
 
 # ============================================================================
 # HEALTH CHECK

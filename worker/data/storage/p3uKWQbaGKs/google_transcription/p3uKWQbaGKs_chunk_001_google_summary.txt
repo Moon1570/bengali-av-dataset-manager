@@ -1,0 +1,13 @@
+Transcription Summary
+====================
+
+Source: p3uKWQbaGKs_chunk_001
+Model: google
+Chunks: 1
+Valid chunks: 1
+Timestamp: 2026-01-13 06:41:46.433175
+
+Combined transcript saved as: p3uKWQbaGKs_chunk_001.txt
+Individual chunks saved in: transcripts_google/
+
+chunk_000.txt: কুমিল্লা ট্রাডিশনাল ইনভেসমেন্ট বাট আমি যখন একটা ইন্সুরেন্স কিনতেছি ইন্সুরেন্স কিন্তু আমি ইমিডিয়েট কিছুদিন পর পর টাকা ফেরত পাবো এই জন্য কিনতেছি না লাইফ ইন্স্যুরেন্স করা হয় মূলত

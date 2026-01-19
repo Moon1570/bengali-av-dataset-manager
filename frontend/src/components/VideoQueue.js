@@ -1,23 +1,28 @@
 import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { getNextVideo, claimVideo, startProcessing, submitResults, submitReview } from '../api';
+import { getNextVideo, getShortVideos, claimVideo, startProcessing, submitResults, submitReview } from '../api';
 
 // Workflow stages
 const STAGES = {
   LOADING: 'loading',
   PREVIEW: 'preview',
   PROCESSING: 'processing',
+  CHUNK_REVIEW: 'chunk_review',
   REVIEWING: 'reviewing',
   COMPLETE: 'complete',
   ERROR: 'error',
-  NO_VIDEOS: 'no_videos'
+  NO_VIDEOS: 'no_videos',
+  SHORT_VIDEO_PICKER: 'short_video_picker'
 };
 
 function VideoQueue({ user }) {
   const [stage, setStage] = useState(STAGES.LOADING);
   const [video, setVideo] = useState(null);
+  const [videoQueue, setVideoQueue] = useState([]); // Local queue of videos
+  const [shortVideos, setShortVideos] = useState([]); // Short videos for picker
   const [presets, setPresets] = useState([]);
   const [selectedPreset, setSelectedPreset] = useState('balanced');
+  const [selectedTranscriptionModel, setSelectedTranscriptionModel] = useState('google');
   const [jobId, setJobId] = useState(null);
   const [error, setError] = useState('');
   
@@ -25,8 +30,13 @@ function VideoQueue({ user }) {
   const [processingLogs, setProcessingLogs] = useState([]);
   const [processingProgress, setProcessingProgress] = useState(0);
   
+  // Processing history check
+  const [processingHistory, setProcessingHistory] = useState(null);
+  const [checkingHistory, setCheckingHistory] = useState(false);
+  
   // Results state
   const [results, setResults] = useState(null);
+  const [processedChunks, setProcessedChunks] = useState([]);
   
   // Review state
   const [reviewData, setReviewData] = useState({
@@ -50,11 +60,40 @@ function VideoQueue({ user }) {
   const loadNextVideo = async () => {
     try {
       setStage(STAGES.LOADING);
+      setProcessingHistory(null); // Reset history
+      
+      // If we have videos in the queue, use the next one
+      if (videoQueue.length > 0) {
+        const nextVideo = videoQueue[0];
+        setVideo(nextVideo);
+        setVideoQueue(prev => prev.slice(1)); // Remove first video from queue
+        setSelectedPreset('balanced');
+        setSelectedTranscriptionModel('google');
+        checkVideoProcessingHistory(nextVideo.video_id);
+        setStage(STAGES.PREVIEW);
+        
+        // If queue is running low (< 2 videos), fetch more in background
+        if (videoQueue.length < 2) {
+          fetchMoreVideos();
+        }
+        return;
+      }
+      
+      // No videos in queue, fetch from server
       const response = await getNextVideo();
-      setVideo(response.data.video);
-      setPresets(response.data.presets);
-      setSelectedPreset('balanced');
-      setStage(STAGES.PREVIEW);
+      
+      if (response.data.videos && response.data.videos.length > 0) {
+        const firstVideo = response.data.videos[0];
+        setVideo(firstVideo);
+        setVideoQueue(response.data.videos.slice(1)); // Store remaining videos
+        setPresets(response.data.presets);
+        setSelectedPreset('balanced');
+        setSelectedTranscriptionModel('google');
+        checkVideoProcessingHistory(firstVideo.video_id);
+        setStage(STAGES.PREVIEW);
+      } else {
+        setStage(STAGES.NO_VIDEOS);
+      }
     } catch (error) {
       if (error.response?.status === 404) {
         setStage(STAGES.NO_VIDEOS);
@@ -62,6 +101,77 @@ function VideoQueue({ user }) {
         setError(error.response?.data?.error || 'Failed to load video');
         setStage(STAGES.ERROR);
       }
+    }
+  };
+
+  const fetchMoreVideos = async () => {
+    try {
+      const response = await getNextVideo();
+      if (response.data.videos && response.data.videos.length > 0) {
+        setVideoQueue(prev => [...prev, ...response.data.videos]);
+      }
+    } catch (error) {
+      console.error('Failed to fetch more videos:', error);
+      // Don't show error to user, just log it
+    }
+  };
+
+  const handleSkipVideo = async () => {
+    try {
+      setStage(STAGES.LOADING);
+      
+      // Just load the next video from queue (no need to call skip API)
+      await loadNextVideo();
+    } catch (error) {
+      console.error('Failed to skip video:', error);
+      // Even if skip fails, try to load next video
+      loadNextVideo();
+    }
+  };
+
+  const handleSearchShortVideos = async () => {
+    try {
+      setStage(STAGES.LOADING);
+      const response = await getShortVideos(120); // Get videos under 2 minutes
+      
+      if (response.data.videos && response.data.videos.length > 0) {
+        setShortVideos(response.data.videos);
+        setStage(STAGES.SHORT_VIDEO_PICKER);
+      } else {
+        setError('No short videos available');
+        setStage(STAGES.ERROR);
+      }
+    } catch (error) {
+      setError(error.response?.data?.message || 'Failed to load short videos');
+      setStage(STAGES.ERROR);
+    }
+  };
+
+  const handleSelectShortVideo = (selectedVideo) => {
+    setVideo(selectedVideo);
+    setShortVideos([]);
+    setSelectedPreset('balanced');
+    setSelectedTranscriptionModel('google');
+    checkVideoProcessingHistory(selectedVideo.video_id);
+    setStage(STAGES.PREVIEW);
+  };
+
+  const checkVideoProcessingHistory = async (videoId) => {
+    setCheckingHistory(true);
+    try {
+      const response = await fetch(`http://localhost:5000/api/videos/${videoId}/check-processed`, {
+        credentials: 'include'
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        setProcessingHistory(data);
+      }
+    } catch (error) {
+      console.error('Failed to check processing history:', error);
+      setProcessingHistory(null);
+    } finally {
+      setCheckingHistory(false);
     }
   };
 
@@ -96,6 +206,7 @@ const startRealProcessing = async () => {
       credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ 
+        transcription_model: selectedTranscriptionModel,
         preset: selectedPreset,
         youtube_url: video.youtube_url 
       })
@@ -123,7 +234,7 @@ const startRealProcessing = async () => {
 
 const pollProcessingStatus = () => {
   let pollCount = 0;
-  const maxPolls = 360; // 30 minutes (360 * 5 seconds)
+  const maxPolls = 2160; // 3 hours (2160 * 5 seconds)
   
   const pollInterval = setInterval(async () => {
     try {
@@ -144,15 +255,54 @@ const pollProcessingStatus = () => {
       const data = await response.json();
       console.log('📊 Status data:', data);
       
-      // Update progress
-      if (data.progress) {
-        console.log('📈 Progress updated:', data.progress);
-        setProcessingProgress(data.progress);
-      }
-      
-      // Update logs
+      // Update logs and calculate progress from steps
       if (data.logs && data.logs.length > 0) {
         setProcessingLogs(data.logs);
+        
+        // Parse logs to determine progress based on steps
+        const allLogs = data.logs.join('\n');
+        
+        let calculatedProgress = 5; // Start at 5%
+        
+        // Detect steps from logs
+        if (allLogs.includes('Step 1/4') || allLogs.includes('Downloading video')) {
+          calculatedProgress = Math.max(calculatedProgress, 10);
+        }
+        if (allLogs.includes('Downloaded:') || allLogs.includes('Step 2/4')) {
+          calculatedProgress = Math.max(calculatedProgress, 25);
+        }
+        if (allLogs.includes('Processing with Docker') || allLogs.includes('Running command')) {
+          calculatedProgress = Math.max(calculatedProgress, 30);
+        }
+        if (allLogs.includes('Docker container') || allLogs.includes('Starting pipeline')) {
+          calculatedProgress = Math.max(calculatedProgress, 35);
+        }
+        if (allLogs.includes('Extracting audio') || allLogs.includes('Audio extraction')) {
+          calculatedProgress = Math.max(calculatedProgress, 45);
+        }
+        if (allLogs.includes('Face detection') || allLogs.includes('Processing faces')) {
+          calculatedProgress = Math.max(calculatedProgress, 55);
+        }
+        if (allLogs.includes('Transcription') || allLogs.includes('Transcribing')) {
+          calculatedProgress = Math.max(calculatedProgress, 65);
+        }
+        if (allLogs.includes('Synchronization') || allLogs.includes('Calculating sync')) {
+          calculatedProgress = Math.max(calculatedProgress, 75);
+        }
+        if (allLogs.includes('Step 3/4') || allLogs.includes('Collecting results')) {
+          calculatedProgress = Math.max(calculatedProgress, 85);
+        }
+        if (allLogs.includes('Step 4/4') || allLogs.includes('Updating database')) {
+          calculatedProgress = Math.max(calculatedProgress, 95);
+        }
+        
+        setProcessingProgress(calculatedProgress);
+      }
+      
+      // Override with explicit progress if provided
+      if (data.progress !== undefined && data.progress !== null) {
+        console.log('📈 Progress updated:', data.progress);
+        setProcessingProgress(data.progress);
       }
       
       if (data.status === 'completed') {
@@ -162,11 +312,26 @@ const pollProcessingStatus = () => {
         setProcessingProgress(100);
         setProcessingLogs(prev => [...prev, '✅ Processing complete!']);
         
-        // Set results and move to review
+        // Set results
         setResults(data.results);
         
+        // Fetch chunk information for review
+        try {
+          const chunksResponse = await fetch(
+            `http://localhost:5000/api/videos/${video.video_id}/chunks`,
+            { credentials: 'include' }
+          );
+          
+          if (chunksResponse.ok) {
+            const chunksData = await chunksResponse.json();
+            setProcessedChunks(chunksData.chunks || []);
+          }
+        } catch (error) {
+          console.error('Failed to fetch chunks:', error);
+        }
+        
         setTimeout(() => {
-          setStage(STAGES.REVIEWING);
+          setStage(STAGES.CHUNK_REVIEW);
         }, 1000);
         
       } else if (data.status === 'failed') {
@@ -183,7 +348,7 @@ const pollProcessingStatus = () => {
       // Timeout check
       if (pollCount >= maxPolls) {
         clearInterval(pollInterval);
-        setError('Processing timeout - took longer than 30 minutes');
+        setError('Processing timeout - took longer than 3 hours');
         setStage(STAGES.ERROR);
       }
       
@@ -359,6 +524,88 @@ const pollProcessingStatus = () => {
     );
   }
 
+  // SHORT VIDEO PICKER STAGE
+  if (stage === STAGES.SHORT_VIDEO_PICKER) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100 p-8">
+        <div className="max-w-6xl mx-auto">
+          {/* Header */}
+          <div className="mb-8 flex items-center justify-between">
+            <button 
+              onClick={loadNextVideo}
+              className="flex items-center gap-2 text-blue-600 hover:text-blue-700 font-medium transition-colors"
+            >
+              <span>←</span>
+              <span>Back to Queue</span>
+            </button>
+            <div className="px-4 py-2 bg-white rounded-lg shadow-sm border border-gray-200">
+              <h1 className="text-xl font-bold bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent">
+                ⚡ Short Videos (Under 2 Minutes)
+              </h1>
+            </div>
+            <div className="w-40"></div>
+          </div>
+
+          {/* Short Videos Grid */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            {shortVideos.map((shortVideo, index) => (
+              <div 
+                key={shortVideo.video_id}
+                className="bg-white rounded-xl shadow-md hover:shadow-xl transition-all duration-300 border border-gray-200 overflow-hidden cursor-pointer"
+                onClick={() => handleSelectShortVideo(shortVideo)}
+              >
+                <div className="relative">
+                  <img
+                    src={`https://img.youtube.com/vi/${shortVideo.video_id}/mqdefault.jpg`}
+                    alt="Video thumbnail"
+                    className="w-full h-48 object-cover"
+                  />
+                  <div className="absolute top-3 right-3 bg-blue-600 text-white px-3 py-1 rounded-full text-sm font-bold shadow-lg">
+                    {Math.floor(shortVideo.duration_seconds / 60)}:{String(shortVideo.duration_seconds % 60).padStart(2, '0')}
+                  </div>
+                </div>
+                
+                <div className="p-5">
+                  <h3 className="text-lg font-semibold text-gray-800 mb-2 line-clamp-2 hover:text-blue-600 transition-colors">
+                    {shortVideo.title}
+                  </h3>
+                  
+                  <div className="flex items-center justify-between mt-4">
+                    <span className="flex items-center gap-2 text-sm text-gray-600">
+                      <span>👤</span>
+                      <span className="font-medium">{shortVideo.speaker_name}</span>
+                    </span>
+                    <span className={`px-3 py-1 rounded-full text-xs font-semibold ${getDomainBadgeColor(shortVideo.domain)}`}>
+                      {shortVideo.domain.replace(/_/g, ' ').toUpperCase()}
+                    </span>
+                  </div>
+
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleSelectShortVideo(shortVideo);
+                    }}
+                    className="mt-4 w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-lg transition"
+                  >
+                    Select This Video
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {shortVideos.length === 0 && (
+            <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-8 text-center">
+              <div className="text-6xl mb-4">⚡</div>
+              <h2 className="text-2xl font-bold text-yellow-800 mb-2">No Short Videos Found</h2>
+              <p className="text-yellow-600 mb-6">Try searching with a longer duration or check back later.</p>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   // PREVIEW STAGE
   if (stage === STAGES.PREVIEW) {
     return (
@@ -425,6 +672,108 @@ const pollProcessingStatus = () => {
               </a>
             </div>
 
+            {/* Processing History Status */}
+            {checkingHistory && (
+              <div className="mb-6 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+                <div className="flex items-center gap-2">
+                  <div className="animate-spin text-blue-600 text-xl">⏳</div>
+                  <span className="text-blue-800 font-medium">Checking processing history...</span>
+                </div>
+              </div>
+            )}
+
+            {processingHistory && processingHistory.already_processed && (
+              <div className="mb-6 p-6 bg-gradient-to-r from-yellow-50 to-orange-50 border-2 border-yellow-300 rounded-xl shadow-sm">
+                <div className="flex items-start gap-3 mb-4">
+                  <span className="text-3xl">⚠️</span>
+                  <div className="flex-1">
+                    <h3 className="text-lg font-bold text-yellow-900 mb-2">Video Already Processed!</h3>
+                    <p className="text-sm text-yellow-800 mb-3">
+                      This video has been processed before. You can skip it or process it again with different settings.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4 mb-4">
+                  {/* Database Status */}
+                  <div className="bg-white rounded-lg p-4 border border-yellow-200">
+                    <div className="flex items-center gap-2 mb-2">
+                      <span className="text-xl">💾</span>
+                      <h4 className="font-semibold text-gray-800">Database</h4>
+                    </div>
+                    {processingHistory.database.exists ? (
+                      <div className="space-y-1 text-sm">
+                        <div className="flex items-center gap-2">
+                          <span className="text-green-600 font-bold">✓</span>
+                          <span className="text-gray-700">Status: <span className="font-medium text-green-600">{processingHistory.database.status}</span></span>
+                        </div>
+                        {processingHistory.database.chunks_created && (
+                          <div className="text-gray-600">
+                            Chunks: {processingHistory.database.chunks_passed}/{processingHistory.database.chunks_created} passed
+                          </div>
+                        )}
+                        {processingHistory.database.completed_at && (
+                          <div className="text-gray-500 text-xs">
+                            Completed: {new Date(processingHistory.database.completed_at).toLocaleDateString()}
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="text-sm text-gray-500">No database record</div>
+                    )}
+                  </div>
+
+                  {/* Processed.json Status */}
+                  <div className="bg-white rounded-lg p-4 border border-yellow-200">
+                    <div className="flex items-center gap-2 mb-2">
+                      <span className="text-xl">📄</span>
+                      <h4 className="font-semibold text-gray-800">Pipeline Cache</h4>
+                    </div>
+                    {processingHistory.processed_json.exists ? (
+                      <div className="space-y-1 text-sm">
+                        <div className="flex items-center gap-2">
+                          <span className="text-green-600 font-bold">✓</span>
+                          <span className="text-gray-700">Found in processed.json</span>
+                        </div>
+                        {processingHistory.processed_json.chunks && (
+                          <div className="text-gray-600">
+                            {processingHistory.processed_json.chunks} chunks cached
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="text-sm text-gray-500">Not in cache</div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Action Buttons */}
+                <div className="flex gap-3">
+                  <button
+                    onClick={handleSkipVideo}
+                    className="flex-1 px-4 py-3 bg-white hover:bg-gray-50 text-gray-700 font-semibold rounded-lg border-2 border-gray-300 transition-all shadow-sm hover:shadow"
+                  >
+                    ⏭️ Skip to Next Video
+                  </button>
+                  <button
+                    onClick={() => setProcessingHistory(null)}
+                    className="flex-1 px-4 py-3 bg-gradient-to-r from-orange-500 to-red-500 hover:from-orange-600 hover:to-red-600 text-white font-semibold rounded-lg transition-all shadow-md hover:shadow-lg"
+                  >
+                    🔄 Process Again Anyway
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {processingHistory && !processingHistory.already_processed && (
+              <div className="mb-6 p-4 bg-green-50 border border-green-200 rounded-lg">
+                <div className="flex items-center gap-2">
+                  <span className="text-xl">✨</span>
+                  <span className="text-green-800 font-medium">Fresh video - Never processed before</span>
+                </div>
+              </div>
+            )}
+
             {/* Processing Preset Selection */}
             <div className="mb-6">
               <h3 className="text-lg font-semibold text-gray-800 mb-3">Choose Processing Quality</h3>
@@ -453,6 +802,69 @@ const pollProcessingStatus = () => {
               </div>
             </div>
 
+            {/* Transcription Model Selection */}
+            <div className="mb-6">
+              <h3 className="text-lg font-semibold text-gray-800 mb-3">Transcription Model</h3>
+              <div className="flex gap-3">
+                <label
+                  className={`flex-1 p-3 border-2 rounded-lg cursor-pointer transition text-center ${
+                    selectedTranscriptionModel === 'google'
+                      ? 'border-blue-500 bg-blue-50'
+                      : 'border-gray-200 hover:border-gray-300'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="transcription"
+                    value="google"
+                    checked={selectedTranscriptionModel === 'google'}
+                    onChange={(e) => setSelectedTranscriptionModel(e.target.value)}
+                    className="hidden"
+                  />
+                  <div className="font-semibold text-gray-800 text-sm">🎤 Google</div>
+                  <p className="text-xs text-gray-600 mt-1">Fast & Accurate</p>
+                </label>
+                
+                <label
+                  className={`flex-1 p-3 border-2 rounded-lg cursor-pointer transition text-center ${
+                    selectedTranscriptionModel === 'whisper'
+                      ? 'border-blue-500 bg-blue-50'
+                      : 'border-gray-200 hover:border-gray-300'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="transcription"
+                    value="whisper"
+                    checked={selectedTranscriptionModel === 'whisper'}
+                    onChange={(e) => setSelectedTranscriptionModel(e.target.value)}
+                    className="hidden"
+                  />
+                  <div className="font-semibold text-gray-800 text-sm">🤖 Whisper</div>
+                  <p className="text-xs text-gray-600 mt-1">Local Processing</p>
+                </label>
+
+                <label
+                  className={`flex-1 p-3 border-2 rounded-lg cursor-pointer transition text-center ${
+                    selectedTranscriptionModel === 'both'
+                      ? 'border-blue-500 bg-blue-50'
+                      : 'border-gray-200 hover:border-gray-300'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="transcription"
+                    value="both"
+                    checked={selectedTranscriptionModel === 'both'}
+                    onChange={(e) => setSelectedTranscriptionModel(e.target.value)}
+                    className="hidden"
+                  />
+                  <div className="font-semibold text-gray-800 text-sm">🔀 Both</div>
+                  <p className="text-xs text-gray-600 mt-1">Compare Results</p>
+                </label>
+              </div>
+            </div>
+
             {/* Warnings */}
             {video.times_rejected > 0 && (
               <div className="mb-6 bg-yellow-50 border border-yellow-200 rounded-lg p-4">
@@ -474,10 +886,18 @@ const pollProcessingStatus = () => {
                 ✅ Claim & Process This Video
               </button>
               <button
-                onClick={loadNextVideo}
+                onClick={handleSkipVideo}
                 className="bg-gray-200 hover:bg-gray-300 text-gray-700 font-medium py-3 px-6 rounded-lg transition"
               >
                 Skip
+              </button>
+              <button
+                onClick={handleSearchShortVideos}
+                className="bg-blue-500 hover:bg-blue-600 text-white font-medium py-3 px-6 rounded-lg transition flex items-center gap-2"
+                title="Find short videos for quick testing"
+              >
+                <span>⚡</span>
+                <span>Short</span>
               </button>
             </div>
 
@@ -511,16 +931,27 @@ const pollProcessingStatus = () => {
                 <span className="flex items-center gap-2">
                   <span className="text-xl">🚀</span>
                   <span>Processing Progress</span>
+                  {processingProgress < 30 && <span className="text-xs text-gray-500">(Downloading...)</span>}
+                  {processingProgress >= 30 && processingProgress < 85 && <span className="text-xs text-gray-500">(Processing with Docker...)</span>}
+                  {processingProgress >= 85 && processingProgress < 100 && <span className="text-xs text-gray-500">(Finalizing...)</span>}
                 </span>
                 <span className="text-3xl font-bold text-blue-600">{processingProgress}%</span>
               </div>
-              <div className="w-full bg-gray-300 rounded-full h-5 shadow-inner">
+              <div className="w-full bg-gray-300 rounded-full h-6 shadow-inner">
                 <div
-                  className="bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500 h-5 rounded-full transition-all duration-500 shadow-lg relative overflow-hidden"
+                  className="bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500 h-6 rounded-full transition-all duration-500 shadow-lg relative overflow-hidden"
                   style={{ width: `${processingProgress}%` }}
                 >
                   <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white to-transparent opacity-30 animate-shimmer"></div>
                 </div>
+              </div>
+              
+              {/* Step indicators */}
+              <div className="flex justify-between mt-3 text-xs text-gray-600">
+                <span className={processingProgress >= 10 ? 'text-blue-600 font-semibold' : ''}>📥 Download</span>
+                <span className={processingProgress >= 30 ? 'text-blue-600 font-semibold' : ''}>🐳 Docker Pipeline</span>
+                <span className={processingProgress >= 85 ? 'text-blue-600 font-semibold' : ''}>💾 Save Results</span>
+                <span className={processingProgress >= 100 ? 'text-green-600 font-semibold' : ''}>✅ Complete</span>
               </div>
             </div>
 
@@ -529,14 +960,38 @@ const pollProcessingStatus = () => {
               <div className="flex items-center gap-2 mb-3">
                 <span className="text-xl">📝</span>
                 <h3 className="font-semibold text-gray-800">Processing Log</h3>
+                <span className="text-xs text-gray-500 ml-auto">Live output from Docker container</span>
               </div>
-              <div className="bg-gray-900 rounded-xl p-6 font-mono text-sm text-green-400 h-80 overflow-y-auto shadow-inner border-2 border-gray-800">
-              {processingLogs.map((log, index) => (
-                <div key={index} className="mb-2 flex items-start gap-2">
-                  <span className="text-gray-500">$</span>
-                  <span className="flex-1">{log}</span>
-                </div>
-              ))}
+              <div className="bg-gray-900 rounded-xl p-6 font-mono text-sm text-green-400 h-96 overflow-y-auto shadow-inner border-2 border-gray-800">
+              {processingLogs.map((log, index) => {
+                // Color code different types of log messages
+                let logColor = 'text-green-400';
+                let prefix = '$';
+                
+                if (log.includes('ERROR') || log.includes('Failed') || log.includes('Error')) {
+                  logColor = 'text-red-400';
+                  prefix = '✗';
+                } else if (log.includes('WARNING') || log.includes('Warning')) {
+                  logColor = 'text-yellow-400';
+                  prefix = '⚠';
+                } else if (log.includes('Step ') || log.includes('Starting') || log.includes('Running')) {
+                  logColor = 'text-blue-400';
+                  prefix = '▶';
+                } else if (log.includes('✅') || log.includes('complete') || log.includes('Complete') || log.includes('success') || log.includes('Success')) {
+                  logColor = 'text-green-300';
+                  prefix = '✓';
+                } else if (log.includes('INFO')) {
+                  logColor = 'text-cyan-400';
+                  prefix = 'ℹ';
+                }
+                
+                return (
+                  <div key={index} className={`mb-1 flex items-start gap-2 ${logColor}`}>
+                    <span className="text-gray-500 flex-shrink-0">{prefix}</span>
+                    <span className="flex-1 whitespace-pre-wrap break-words">{log}</span>
+                  </div>
+                );
+              })}
               {processingProgress < 100 && (
                 <div className="flex items-center gap-2 mt-2">
                   <div className="animate-pulse text-green-400">▊</div>
@@ -553,6 +1008,130 @@ const pollProcessingStatus = () => {
               <p className="text-sm text-gray-600">
                 🐳 Processing is happening on your local machine via Docker container.
               </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // CHUNK REVIEW STAGE
+  if (stage === STAGES.CHUNK_REVIEW) {
+    return (
+      <div className="min-h-screen bg-gray-50 p-8">
+        <div className="max-w-7xl mx-auto">
+          <div className="bg-white rounded-xl shadow-md p-8">
+            <div className="flex items-center justify-between mb-6">
+              <div>
+                <h2 className="text-2xl font-bold text-gray-800 mb-2">Review Processed Chunks</h2>
+                <p className="text-gray-600">{video.title}</p>
+              </div>
+              <div className="text-right">
+                <p className="text-sm text-gray-600">Total Chunks</p>
+                <p className="text-3xl font-bold text-blue-600">{processedChunks.length}</p>
+              </div>
+            </div>
+
+            {/* Summary Stats */}
+            <div className="grid grid-cols-4 gap-4 mb-8">
+              <div className="bg-blue-50 p-4 rounded-lg">
+                <p className="text-sm text-gray-600 mb-1">Total Created</p>
+                <p className="text-2xl font-bold text-blue-600">{results?.chunks_created || 0}</p>
+              </div>
+              <div className="bg-green-50 p-4 rounded-lg">
+                <p className="text-sm text-gray-600 mb-1">Passed SyncNet</p>
+                <p className="text-2xl font-bold text-green-600">{results?.chunks_passed_sync || 0}</p>
+              </div>
+              <div className="bg-purple-50 p-4 rounded-lg">
+                <p className="text-sm text-gray-600 mb-1">Usable Duration</p>
+                <p className="text-2xl font-bold text-purple-600">{((results?.usable_duration_seconds || 0) / 60).toFixed(1)}m</p>
+              </div>
+              <div className="bg-orange-50 p-4 rounded-lg">
+                <p className="text-sm text-gray-600 mb-1">Total Size</p>
+                <p className="text-2xl font-bold text-orange-600">{(results?.total_size_mb || 0).toFixed(1)} MB</p>
+              </div>
+            </div>
+
+            {/* Chunks Grid */}
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
+              {processedChunks.map((chunk, index) => (
+                <div key={chunk.chunk_id} className="bg-gray-50 rounded-lg p-4 border-2 border-gray-200 hover:border-blue-400 transition-all">
+                  <div className="flex items-center justify-between mb-3">
+                    <span className="text-sm font-semibold text-gray-700">Chunk {index + 1}</span>
+                    <div className="flex gap-1">
+                      {chunk.has_audio && <span className="text-xs bg-green-100 text-green-700 px-2 py-1 rounded">🎵 Audio</span>}
+                      {chunk.has_cropped && <span className="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded">✂️ Cropped</span>}
+                      {chunk.has_bbox && <span className="text-xs bg-purple-100 text-purple-700 px-2 py-1 rounded">📦 BBox</span>}
+                    </div>
+                  </div>
+                  
+                  {/* Video Player */}
+                  <div className="mb-3 bg-black rounded-lg overflow-hidden">
+                    <video 
+                      controls 
+                      className="w-full"
+                      src={`http://localhost:5000${chunk.video_url}`}
+                      style={{ maxHeight: '200px' }}
+                    >
+                      Your browser does not support the video tag.
+                    </video>
+                  </div>
+                  
+                  {/* Transcription */}
+                  {chunk.transcription && (
+                    <div className="mb-3">
+                      <p className="text-xs text-gray-500 mb-1">Transcription:</p>
+                      <p className="text-sm text-gray-700 bg-white p-2 rounded border border-gray-200 max-h-20 overflow-y-auto">
+                        {chunk.transcription}
+                      </p>
+                    </div>
+                  )}
+                  
+                  {/* Quality Indicators */}
+                  <div className="flex items-center gap-2 text-xs text-gray-600">
+                    <span className="flex items-center gap-1">
+                      <span>{chunk.has_audio ? '✅' : '⚠️'}</span>
+                      <span>Audio</span>
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <span>{chunk.has_cropped ? '✅' : '⚠️'}</span>
+                      <span>Cropped</span>
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <span>{chunk.transcription ? '✅' : '⚠️'}</span>
+                      <span>Text</span>
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Action Buttons */}
+            <div className="flex justify-between items-center pt-6 border-t border-gray-200">
+              <button
+                onClick={() => setStage(STAGES.PROCESSING)}
+                className="px-6 py-3 bg-gray-200 hover:bg-gray-300 text-gray-700 font-semibold rounded-lg transition-all"
+              >
+                ← Back to Logs
+              </button>
+              <div className="flex gap-4">
+                <button
+                  onClick={() => {
+                    if (window.confirm('Are you sure you want to reject all chunks and reprocess?')) {
+                      setStage(STAGES.PREVIEW);
+                    }
+                  }}
+                  className="px-6 py-3 bg-red-100 hover:bg-red-200 text-red-700 font-semibold rounded-lg transition-all"
+                >
+                  ❌ Reject & Reprocess
+                </button>
+                <button
+                  onClick={() => setStage(STAGES.REVIEWING)}
+                  className="px-8 py-3 bg-gradient-to-r from-green-500 to-green-600 hover:from-green-600 hover:to-green-700 text-white font-semibold rounded-lg shadow-lg transition-all"
+                >
+                  ✅ Approve & Continue to Review
+                </button>
+              </div>
             </div>
           </div>
         </div>

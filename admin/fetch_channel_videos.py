@@ -31,6 +31,47 @@ def get_db():
         port=config.DB_PORT
     )
 
+def parse_duration(duration_str):
+    """Convert ISO 8601 duration to seconds"""
+    import re
+    
+    # PT1H2M10S -> 3730 seconds
+    pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
+    match = re.match(pattern, duration_str)
+    
+    if not match:
+        return 0
+    
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    
+    return hours * 3600 + minutes * 60 + seconds
+
+def get_video_details(youtube, video_ids):
+    """Fetch detailed metadata for videos"""
+    try:
+        request = youtube.videos().list(
+            part='contentDetails,snippet,statistics',
+            id=','.join(video_ids)
+        )
+        response = request.execute()
+        
+        details = {}
+        for item in response['items']:
+            video_id = item['id']
+            details[video_id] = {
+                'duration': parse_duration(item['contentDetails']['duration']),
+                'description': item['snippet'].get('description', ''),
+                'thumbnail': item['snippet']['thumbnails']['high']['url'],
+                'view_count': item['statistics'].get('viewCount', 0)
+            }
+        
+        return details
+    except Exception as e:
+        print(f"Error fetching video details: {e}")
+        return {}
+
 def get_channel_videos(channel_id, max_results=50):
     """Fetch videos from a YouTube channel"""
     youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
@@ -53,16 +94,33 @@ def get_channel_videos(channel_id, max_results=50):
             
             response = request.execute()
             
+            video_ids = []
+            for item in response['items']:
+                video_ids.append(item['id']['videoId'])
+            
+            # Fetch detailed metadata for these videos (in batches of 50)
+            if video_ids:
+                video_details = get_video_details(youtube, video_ids)
+            else:
+                video_details = {}
+            
             for item in response['items']:
                 video_id = item['id']['videoId']
                 title = item['snippet']['title']
                 upload_date = item['snippet']['publishedAt'][:10]
                 
+                # Get detailed metadata
+                details = video_details.get(video_id, {})
+                
                 videos.append({
                     'video_id': video_id,
                     'title': title,
                     'upload_date': upload_date,
-                    'url': f'https://www.youtube.com/watch?v={video_id}'
+                    'url': f'https://www.youtube.com/watch?v={video_id}',
+                    'duration_seconds': details.get('duration', 0),
+                    'description': details.get('description', ''),
+                    'thumbnail_url': details.get('thumbnail', ''),
+                    'view_count': details.get('view_count', 0)
                 })
             
             next_page_token = response.get('nextPageToken')
@@ -85,19 +143,27 @@ def add_videos_to_db(speaker_id, videos):
     
     for video in videos:
         try:
-            # Add video
+            # Add video with all metadata
             cur.execute("""
                 INSERT INTO videos 
-                (video_id, youtube_url, speaker_id, title, upload_date)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (video_id) DO NOTHING
+                (video_id, youtube_url, speaker_id, title, description, 
+                 duration_seconds, upload_date, thumbnail_url)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (video_id) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    description = EXCLUDED.description,
+                    duration_seconds = EXCLUDED.duration_seconds,
+                    thumbnail_url = EXCLUDED.thumbnail_url
                 RETURNING video_id
             """, (
                 video['video_id'],
                 video['url'],
                 speaker_id,
                 video['title'],
-                video['upload_date']
+                video.get('description', ''),
+                video.get('duration_seconds', 0),
+                video['upload_date'],
+                video.get('thumbnail_url', '')
             ))
             
             if cur.fetchone():

@@ -1,0 +1,13 @@
+Transcription Summary
+====================
+
+Source: lLdzSv_4MLA_chunk_000
+Model: google
+Chunks: 1
+Valid chunks: 1
+Timestamp: 2026-01-15 12:07:56.953880
+
+Combined transcript saved as: lLdzSv_4MLA_chunk_000.txt
+Individual chunks saved in: transcripts_google/
+
+chunk_000.txt: আমার যে অডিয়েন্স সেই অডিয়েন্সকে আমি ও টার্গেট করতে পেরেছি অরেঞ্জ কে আরো 500 বিজনেস টার্গেট করতে পারে বাট এই 501 টা বিজনেসের মধ্যে আমি প্লাস আরো পাশে যারা আছে

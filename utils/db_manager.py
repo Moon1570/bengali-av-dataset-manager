@@ -26,17 +26,27 @@ def get_db():
     )
 
 
-def list_tables():
-    """List all tables in the database"""
+def list_tables(table_type=None):
+    """List all tables in the database
+    
+    Args:
+        table_type: Filter by 'BASE TABLE' or 'VIEW'. None returns all.
+    """
     conn = get_db()
     cur = conn.cursor()
     
-    cur.execute("""
+    query = """
         SELECT table_name 
         FROM information_schema.tables 
-        WHERE table_schema = 'public' 
-        ORDER BY table_name
-    """)
+        WHERE table_schema = 'public'
+    """
+    
+    if table_type:
+        query += f" AND table_type = '{table_type}'"
+    
+    query += " ORDER BY table_name"
+    
+    cur.execute(query)
     
     tables = cur.fetchall()
     cur.close()
@@ -127,14 +137,15 @@ def clear_table(table_name, confirm=True):
 
 
 def clear_all_tables(confirm=True):
-    """Clear all data from all tables"""
+    """Clear all data from all tables (skips views)"""
     if confirm:
         response = input("⚠️  Are you sure you want to clear ALL tables? This cannot be undone! (yes/no): ")
         if response.lower() != 'yes':
             print("❌ Operation cancelled")
             return False
     
-    tables = list_tables()
+    # Get only actual tables, not views
+    tables = list_tables(table_type='BASE TABLE')
     conn = get_db()
     cur = conn.cursor()
     
@@ -144,10 +155,11 @@ def clear_all_tables(confirm=True):
         'processing_jobs',
         'videos',
         'speakers',
-        'workers'
+        'workers',
+        'admin_actions'
     ]
     
-    # Add any remaining tables
+    # Add any remaining tables (excluding ones already in ordered_tables)
     for table in tables:
         if table not in ordered_tables:
             ordered_tables.append(table)

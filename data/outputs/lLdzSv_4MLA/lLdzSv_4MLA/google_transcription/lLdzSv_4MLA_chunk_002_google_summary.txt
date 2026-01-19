@@ -1,0 +1,14 @@
+Transcription Summary
+====================
+
+Source: lLdzSv_4MLA_chunk_002
+Model: google
+Chunks: 2
+Valid chunks: 2
+Timestamp: 2026-01-15 12:08:02.224989
+
+Combined transcript saved as: lLdzSv_4MLA_chunk_002.txt
+Individual chunks saved in: transcripts_google/
+
+chunk_000.txt: এবং সে যদি ভালো ক্রিয়েটিভ দেখে ভালো ক্রিয়েটিভ মানে অনেক জাঁকজমকপূর্ণ অনেক ছবি আছে ভিডিও আছে ওরকম
+chunk_001.txt: তার সাথে যায় এরকম একটা ক্রিয়েটিভ সে যদি দেখে তাহলে তার কনভার্ট হওয়ার চান্স অনেক বেশি এবং ক্রিয়েটিভ এর কোয়ালিটি যত বেশি হবে

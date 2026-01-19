@@ -1,0 +1,15 @@
+Transcription Summary
+====================
+
+Source: 2JiOgKY7viw_chunk_000
+Model: google
+Chunks: 3
+Valid chunks: 3
+Timestamp: 2026-01-13 06:48:28.500221
+
+Combined transcript saved as: 2JiOgKY7viw_chunk_000.txt
+Individual chunks saved in: transcripts_google/
+
+chunk_000.txt: এই মানুষগুলার একটু সময় দরকার হয় সবকিছু আবার নতুন করে বোঝানোর জন্য
+chunk_002.txt: স্কুলের বেতন বা বাজারের খরচগুলো অপেক্ষা করে না এগুলো ইমিডিয়েটলি লাগে সময়টা পাওয়া যায় না
+chunk_003.txt: লাইফ ইন্স্যুরেন্স এর ব্যাপারটা করে উইথ লাইফ ইন্সুরেন্সের যে টাকাটা পাওয়া যায় সেই টাকাটা এই পরিবারটাকে 2 বছর 5 বছর

@@ -27,6 +27,9 @@ export const getCurrentUser = () =>
 export const getNextVideo = () => 
   api.get('/api/videos/next');
 
+export const getShortVideos = (maxDuration = 120) => 
+  api.get(`/api/videos/short?max_duration=${maxDuration}`);
+
 export const claimVideo = (videoId, preset) => 
   api.post(`/api/videos/${videoId}/claim`, { preset });
 
