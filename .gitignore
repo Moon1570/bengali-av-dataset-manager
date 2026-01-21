@@ -1,0 +1,66 @@
+# Environment variables
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+.venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Data
+data/storage/
+data/downloads/
+*.mp4
+*.wav
+*.avi
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# videos
+*.webm
+*.mkv
+*.flv
+*.mov
+*.wmv
+*.mpg
+*.mpeg
+*.3gp
+*.m4v
+*.ts
+*.vob
+*.rmvb
+*.ogv
+*.f4v
+*.divx
+*.xvid
+*.asf
+*.rm
+mp4chops/
+mp4
