@@ -23,6 +23,7 @@ function VideoQueue({ user }) {
   const [presets, setPresets] = useState([]);
   const [selectedPreset, setSelectedPreset] = useState('balanced');
   const [selectedTranscriptionModel, setSelectedTranscriptionModel] = useState('google');
+  const [selectedVideoDomain, setSelectedVideoDomain] = useState(''); // Video domain
   const [jobId, setJobId] = useState(null);
   const [error, setError] = useState('');
   
@@ -37,6 +38,8 @@ function VideoQueue({ user }) {
   // Results state
   const [results, setResults] = useState(null);
   const [processedChunks, setProcessedChunks] = useState([]);
+  const [chunksToDelete, setChunksToDelete] = useState(new Set());
+  const [selectedFormat, setSelectedFormat] = useState({}); // Track selected format per chunk
   
   // Review state
   const [reviewData, setReviewData] = useState({
@@ -61,6 +64,8 @@ function VideoQueue({ user }) {
     try {
       setStage(STAGES.LOADING);
       setProcessingHistory(null); // Reset history
+      setChunksToDelete(new Set()); // Reset deletion state
+      setSelectedFormat({}); // Reset format selection
       
       // If we have videos in the queue, use the next one
       if (videoQueue.length > 0) {
@@ -69,6 +74,8 @@ function VideoQueue({ user }) {
         setVideoQueue(prev => prev.slice(1)); // Remove first video from queue
         setSelectedPreset('balanced');
         setSelectedTranscriptionModel('google');
+        // Set video domain: use video_domain if available, otherwise fallback to speaker_domain
+        setSelectedVideoDomain(nextVideo.video_domain || nextVideo.speaker_domain || 'general');
         checkVideoProcessingHistory(nextVideo.video_id);
         setStage(STAGES.PREVIEW);
         
@@ -89,6 +96,8 @@ function VideoQueue({ user }) {
         setPresets(response.data.presets);
         setSelectedPreset('balanced');
         setSelectedTranscriptionModel('google');
+        // Set video domain: use video_domain if available, otherwise fallback to speaker_domain
+        setSelectedVideoDomain(firstVideo.video_domain || firstVideo.speaker_domain || 'general');
         checkVideoProcessingHistory(firstVideo.video_id);
         setStage(STAGES.PREVIEW);
       } else {
@@ -316,18 +325,31 @@ const pollProcessingStatus = () => {
         setResults(data.results);
         
         // Fetch chunk information for review
+        console.log(`📦 Fetching chunks for video: ${video.video_id}`);
         try {
           const chunksResponse = await fetch(
             `http://localhost:5000/api/videos/${video.video_id}/chunks`,
             { credentials: 'include' }
           );
           
+          console.log(`📦 Chunks response status: ${chunksResponse.status}`);
+          
           if (chunksResponse.ok) {
             const chunksData = await chunksResponse.json();
+            console.log(`📦 Fetched ${chunksData.chunks?.length || 0} chunks:`, chunksData);
             setProcessedChunks(chunksData.chunks || []);
+            
+            if (chunksData.chunks && chunksData.chunks.length > 0) {
+              console.log('✅ Chunks loaded successfully');
+            } else {
+              console.warn('⚠️ No chunks found in response');
+            }
+          } else {
+            const errorData = await chunksResponse.json();
+            console.error('❌ Failed to fetch chunks:', errorData);
           }
         } catch (error) {
-          console.error('Failed to fetch chunks:', error);
+          console.error('❌ Error fetching chunks:', error);
         }
         
         setTimeout(() => {
@@ -456,6 +478,29 @@ const pollProcessingStatus = () => {
     return colors[domain] || colors['general'];
   };
 
+  const updateVideoDomain = async (newDomain) => {
+    try {
+      const response = await fetch(`http://localhost:5000/api/videos/${video.video_id}/update-domain`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain: newDomain })
+      });
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to update domain');
+      }
+
+      setSelectedVideoDomain(newDomain);
+      // Update video object
+      setVideo(prev => ({ ...prev, video_domain: newDomain }));
+    } catch (error) {
+      console.error('Failed to update domain:', error);
+      setError('Failed to update domain: ' + error.message);
+    }
+  };
+
   // Render based on stage
   if (stage === STAGES.LOADING) {
     return (
@@ -575,9 +620,11 @@ const pollProcessingStatus = () => {
                       <span>👤</span>
                       <span className="font-medium">{shortVideo.speaker_name}</span>
                     </span>
-                    <span className={`px-3 py-1 rounded-full text-xs font-semibold ${getDomainBadgeColor(shortVideo.domain)}`}>
-                      {shortVideo.domain.replace(/_/g, ' ').toUpperCase()}
-                    </span>
+                    {(shortVideo.video_domain || shortVideo.speaker_domain) && (
+                      <span className={`px-3 py-1 rounded-full text-xs font-semibold ${getDomainBadgeColor(shortVideo.video_domain || shortVideo.speaker_domain)}`}>
+                        {(shortVideo.video_domain || shortVideo.speaker_domain).replace(/_/g, ' ').toUpperCase()}
+                      </span>
+                    )}
                   </div>
 
                   <button
@@ -631,17 +678,44 @@ const pollProcessingStatus = () => {
               <div className="flex items-start justify-between mb-6">
                 <div className="flex-1">
                   <h2 className="text-2xl font-bold text-gray-800 mb-3">{video.title}</h2>
-                  <div className="flex items-center gap-4 text-sm">
+                  <div className="flex items-center gap-4 text-sm mb-4">
                     <span className="flex items-center gap-2 text-gray-600">
                       <span className="text-lg">👤</span>
                       <span className="font-medium">{video.speaker_name}</span>
                     </span>
-                    <span className={`px-4 py-1.5 rounded-full text-sm font-semibold ${getDomainBadgeColor(video.domain)}`}>
-                      {video.domain.replace(/_/g, ' ').toUpperCase()}
-                    </span>
+                    {selectedVideoDomain && (
+                      <span className={`px-4 py-1.5 rounded-full text-sm font-semibold ${getDomainBadgeColor(selectedVideoDomain)}`}>
+                        {selectedVideoDomain.replace(/_/g, ' ').toUpperCase()}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Domain Selection */}
+                  <div className="bg-gray-50 border border-gray-200 rounded-lg p-4">
+                    <label className="block text-sm font-semibold text-gray-700 mb-2">
+                      📂 Video Domain
+                    </label>
+                    <select
+                      value={selectedVideoDomain || 'general'}
+                      onChange={(e) => updateVideoDomain(e.target.value)}
+                      className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
+                    >
+                      <option value="food_blogger">🍳 Food Blogger</option>
+                      <option value="academician">🎓 Academician</option>
+                      <option value="economic">💹 Economic</option>
+                      <option value="financial">💰 Financial</option>
+                      <option value="motivational_speaker">💪 Motivational Speaker</option>
+                      <option value="comedian">😄 Comedian</option>
+                      <option value="sports_and_gaming">🎮 Sports & Gaming</option>
+                      <option value="general">📋 General</option>
+                      <option value="other">🔖 Other</option>
+                    </select>
+                    <p className="mt-2 text-xs text-gray-500">
+                      Default: <span className="font-medium">{video.speaker_domain?.replace(/_/g, ' ') || 'Not set'}</span> (from speaker profile)
+                    </p>
                   </div>
                 </div>
-                <div className="text-right bg-gradient-to-br from-blue-50 to-indigo-50 p-4 rounded-xl border border-blue-200">
+                <div className="text-right bg-gradient-to-br from-blue-50 to-indigo-50 p-4 rounded-xl border border-blue-200 ml-6">
                   <div className="text-xs text-gray-600 mb-1">Duration</div>
                   <div className="text-2xl font-bold text-blue-600">
                     {Math.floor(video.duration_seconds / 60)}:{String(video.duration_seconds % 60).padStart(2, '0')}
@@ -1052,59 +1126,242 @@ const pollProcessingStatus = () => {
               </div>
             </div>
 
+            {/* Debug Info */}
+            {processedChunks.length === 0 && (
+              <div className="mb-6 p-4 bg-yellow-50 border-2 border-yellow-300 rounded-lg">
+                <div className="mb-2">
+                  <span className="text-xl">🔍</span>
+                  <span className="font-bold text-yellow-800 ml-2">Debug Information</span>
+                </div>
+                <div className="text-sm text-gray-700 space-y-1">
+                  <p><strong>Video ID:</strong> {video.video_id}</p>
+                  <p><strong>Storage Path:</strong> {results?.storage_path || 'Not set'}</p>
+                  <p><strong>Chunks in state:</strong> {processedChunks.length}</p>
+                  <button
+                    onClick={async () => {
+                      console.log('🔄 Manual chunk fetch for:', video.video_id);
+                      try {
+                        const response = await fetch(
+                          `http://localhost:5000/api/videos/${video.video_id}/chunks`,
+                          { credentials: 'include' }
+                        );
+                        console.log('Response status:', response.status);
+                        const data = await response.json();
+                        console.log('Response data:', data);
+                        if (response.ok && data.chunks) {
+                          setProcessedChunks(data.chunks);
+                          alert(`Loaded ${data.chunks.length} chunks!`);
+                        } else {
+                          alert(`Failed: ${data.error || 'Unknown error'}`);
+                        }
+                      } catch (error) {
+                        console.error('Error:', error);
+                        alert('Error: ' + error.message);
+                      }
+                    }}
+                    className="mt-2 px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-medium"
+                  >
+                    🔄 Retry Loading Chunks
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Chunks Grid */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
-              {processedChunks.map((chunk, index) => (
-                <div key={chunk.chunk_id} className="bg-gray-50 rounded-lg p-4 border-2 border-gray-200 hover:border-blue-400 transition-all">
-                  <div className="flex items-center justify-between mb-3">
-                    <span className="text-sm font-semibold text-gray-700">Chunk {index + 1}</span>
-                    <div className="flex gap-1">
-                      {chunk.has_audio && <span className="text-xs bg-green-100 text-green-700 px-2 py-1 rounded">🎵 Audio</span>}
-                      {chunk.has_cropped && <span className="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded">✂️ Cropped</span>}
-                      {chunk.has_bbox && <span className="text-xs bg-purple-100 text-purple-700 px-2 py-1 rounded">📦 BBox</span>}
+            <div className="grid grid-cols-1 gap-6 mb-8">
+              {processedChunks.map((chunk, index) => {
+                const isMarkedForDeletion = chunksToDelete.has(chunk.chunk_id);
+                const currentFormat = selectedFormat[chunk.chunk_id] || 'normal';
+                
+                return (
+                  <div 
+                    key={chunk.chunk_id} 
+                    className={`bg-white rounded-xl p-6 border-2 transition-all shadow-md ${
+                      isMarkedForDeletion 
+                        ? 'border-red-300 bg-red-50 opacity-60' 
+                        : 'border-gray-200 hover:border-blue-400'
+                    }`}
+                  >
+                    {/* Header */}
+                    <div className="flex items-center justify-between mb-4">
+                      <div className="flex items-center gap-3">
+                        <span className="text-lg font-bold text-gray-800">Chunk {index + 1}</span>
+                        {isMarkedForDeletion && (
+                          <span className="text-xs bg-red-100 text-red-700 px-3 py-1 rounded-full font-semibold">
+                            ❌ Marked for Deletion
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex gap-2">
+                        {chunk.has_audio && <span className="text-xs bg-green-100 text-green-700 px-2 py-1 rounded font-medium">🎵 Audio</span>}
+                        {chunk.has_cropped && <span className="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded font-medium">✂️ Cropped</span>}
+                        {chunk.has_bbox && <span className="text-xs bg-purple-100 text-purple-700 px-2 py-1 rounded font-medium">📦 BBox</span>}
+                      </div>
+                    </div>
+                    
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                      {/* Video Preview Section */}
+                      <div>
+                        {/* Format Selector */}
+                        <div className="mb-3 flex gap-2">
+                          <button
+                            onClick={() => setSelectedFormat(prev => ({ ...prev, [chunk.chunk_id]: 'normal' }))}
+                            className={`flex-1 px-3 py-2 text-sm font-medium rounded-lg transition-all ${
+                              currentFormat === 'normal'
+                                ? 'bg-blue-600 text-white shadow-md'
+                                : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                            }`}
+                          >
+                            📹 Normal
+                          </button>
+                          {chunk.has_cropped && (
+                            <button
+                              onClick={() => setSelectedFormat(prev => ({ ...prev, [chunk.chunk_id]: 'cropped' }))}
+                              className={`flex-1 px-3 py-2 text-sm font-medium rounded-lg transition-all ${
+                                currentFormat === 'cropped'
+                                  ? 'bg-blue-600 text-white shadow-md'
+                                  : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                              }`}
+                            >
+                              ✂️ Cropped
+                            </button>
+                          )}
+                          {chunk.has_bbox && (
+                            <button
+                              onClick={() => setSelectedFormat(prev => ({ ...prev, [chunk.chunk_id]: 'bbox' }))}
+                              className={`flex-1 px-3 py-2 text-sm font-medium rounded-lg transition-all ${
+                                currentFormat === 'bbox'
+                                  ? 'bg-blue-600 text-white shadow-md'
+                                  : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                              }`}
+                            >
+                              📦 BBox
+                            </button>
+                          )}
+                        </div>
+                        
+                        {/* Video Player */}
+                        <div className="bg-black rounded-lg overflow-hidden mb-3">
+                          <video 
+                            controls 
+                            className="w-full"
+                            src={`http://localhost:5000${
+                              currentFormat === 'cropped' ? chunk.cropped_url :
+                              currentFormat === 'bbox' ? chunk.bbox_url :
+                              chunk.video_url
+                            }`}
+                            style={{ maxHeight: '300px' }}
+                            key={currentFormat}
+                          >
+                            Your browser does not support the video tag.
+                          </video>
+                        </div>
+                        
+                        {/* Quality Indicators */}
+                        <div className="flex items-center gap-3 text-xs">
+                          <span className="flex items-center gap-1">
+                            <span>{chunk.has_audio ? '✅' : '❌'}</span>
+                            <span className="text-gray-600">Audio</span>
+                          </span>
+                          <span className="flex items-center gap-1">
+                            <span>{chunk.has_cropped ? '✅' : '❌'}</span>
+                            <span className="text-gray-600">Cropped</span>
+                          </span>
+                          <span className="flex items-center gap-1">
+                            <span>{chunk.has_bbox ? '✅' : '❌'}</span>
+                            <span className="text-gray-600">BBox</span>
+                          </span>
+                          <span className="flex items-center gap-1">
+                            <span>{chunk.transcription ? '✅' : '❌'}</span>
+                            <span className="text-gray-600">Transcript</span>
+                          </span>
+                        </div>
+                      </div>
+                      
+                      {/* Transcription & Actions Section */}
+                      <div className="flex flex-col">
+                        {/* Transcription */}
+                        <div className="flex-1 mb-4">
+                          <div className="flex items-center gap-2 mb-2">
+                            <span className="text-sm font-semibold text-gray-700">📝 Transcription</span>
+                          </div>
+                          {chunk.transcription ? (
+                            <div className="bg-gray-50 p-4 rounded-lg border border-gray-200 max-h-40 overflow-y-auto">
+                              <p className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed">
+                                {chunk.transcription}
+                              </p>
+                            </div>
+                          ) : (
+                            <div className="bg-yellow-50 p-4 rounded-lg border border-yellow-200">
+                              <p className="text-sm text-yellow-700">⚠️ No transcription available</p>
+                            </div>
+                          )}
+                        </div>
+                        
+                        {/* Keep/Delete Actions */}
+                        <div className="flex gap-3">
+                          {isMarkedForDeletion ? (
+                            <button
+                              onClick={() => {
+                                const newSet = new Set(chunksToDelete);
+                                newSet.delete(chunk.chunk_id);
+                                setChunksToDelete(newSet);
+                              }}
+                              className="flex-1 px-4 py-3 bg-green-500 hover:bg-green-600 text-white font-semibold rounded-lg transition-all shadow-md"
+                            >
+                              ✅ Keep This Chunk
+                            </button>
+                          ) : (
+                            <>
+                              <button
+                                onClick={() => {
+                                  const newSet = new Set(chunksToDelete);
+                                  newSet.add(chunk.chunk_id);
+                                  setChunksToDelete(newSet);
+                                }}
+                                className="flex-1 px-4 py-3 bg-red-100 hover:bg-red-200 text-red-700 font-semibold rounded-lg transition-all border-2 border-red-300"
+                              >
+                                ❌ Delete
+                              </button>
+                              <button
+                                className="flex-1 px-4 py-3 bg-green-100 hover:bg-green-200 text-green-700 font-semibold rounded-lg transition-all border-2 border-green-300"
+                              >
+                                ✅ Keep
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </div>
                     </div>
                   </div>
-                  
-                  {/* Video Player */}
-                  <div className="mb-3 bg-black rounded-lg overflow-hidden">
-                    <video 
-                      controls 
-                      className="w-full"
-                      src={`http://localhost:5000${chunk.video_url}`}
-                      style={{ maxHeight: '200px' }}
-                    >
-                      Your browser does not support the video tag.
-                    </video>
-                  </div>
-                  
-                  {/* Transcription */}
-                  {chunk.transcription && (
-                    <div className="mb-3">
-                      <p className="text-xs text-gray-500 mb-1">Transcription:</p>
-                      <p className="text-sm text-gray-700 bg-white p-2 rounded border border-gray-200 max-h-20 overflow-y-auto">
-                        {chunk.transcription}
+                );
+              })}
+            </div>
+
+            {/* Deletion Summary */}
+            {chunksToDelete.size > 0 && (
+              <div className="mb-6 p-4 bg-red-50 border-2 border-red-300 rounded-lg">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <span className="text-2xl">⚠️</span>
+                    <div>
+                      <p className="font-semibold text-red-800">
+                        {chunksToDelete.size} chunk(s) marked for deletion
+                      </p>
+                      <p className="text-sm text-red-600">
+                        These chunks will be excluded from the final dataset
                       </p>
                     </div>
-                  )}
-                  
-                  {/* Quality Indicators */}
-                  <div className="flex items-center gap-2 text-xs text-gray-600">
-                    <span className="flex items-center gap-1">
-                      <span>{chunk.has_audio ? '✅' : '⚠️'}</span>
-                      <span>Audio</span>
-                    </span>
-                    <span className="flex items-center gap-1">
-                      <span>{chunk.has_cropped ? '✅' : '⚠️'}</span>
-                      <span>Cropped</span>
-                    </span>
-                    <span className="flex items-center gap-1">
-                      <span>{chunk.transcription ? '✅' : '⚠️'}</span>
-                      <span>Text</span>
-                    </span>
                   </div>
+                  <button
+                    onClick={() => setChunksToDelete(new Set())}
+                    className="px-4 py-2 bg-white hover:bg-gray-100 text-red-700 font-medium rounded-lg transition-all border border-red-300"
+                  >
+                    Clear All
+                  </button>
                 </div>
-              ))}
-            </div>
+              </div>
+            )}
 
             {/* Action Buttons */}
             <div className="flex justify-between items-center pt-6 border-t border-gray-200">
@@ -1114,10 +1371,17 @@ const pollProcessingStatus = () => {
               >
                 ← Back to Logs
               </button>
-              <div className="flex gap-4">
+              <div className="flex items-center gap-4">
+                <div className="text-right">
+                  <p className="text-sm text-gray-600">Final Chunks</p>
+                  <p className="text-2xl font-bold text-green-600">
+                    {processedChunks.length - chunksToDelete.size} / {processedChunks.length}
+                  </p>
+                </div>
                 <button
                   onClick={() => {
                     if (window.confirm('Are you sure you want to reject all chunks and reprocess?')) {
+                      setChunksToDelete(new Set());
                       setStage(STAGES.PREVIEW);
                     }
                   }}
@@ -1126,10 +1390,20 @@ const pollProcessingStatus = () => {
                   ❌ Reject & Reprocess
                 </button>
                 <button
-                  onClick={() => setStage(STAGES.REVIEWING)}
+                  onClick={() => {
+                    // Update results with manual approval/rejection counts
+                    const updatedResults = {
+                      ...results,
+                      chunks_manually_approved: processedChunks.length - chunksToDelete.size,
+                      chunks_manually_rejected: chunksToDelete.size
+                    };
+                    setResults(updatedResults);
+                    setStage(STAGES.REVIEWING);
+                  }}
                   className="px-8 py-3 bg-gradient-to-r from-green-500 to-green-600 hover:from-green-600 hover:to-green-700 text-white font-semibold rounded-lg shadow-lg transition-all"
+                  disabled={processedChunks.length - chunksToDelete.size === 0}
                 >
-                  ✅ Approve & Continue to Review
+                  ✅ Approve {processedChunks.length - chunksToDelete.size} Chunks
                 </button>
               </div>
             </div>
@@ -1154,7 +1428,7 @@ const pollProcessingStatus = () => {
             {/* Results Summary */}
             <div className="mb-8 bg-blue-50 border border-blue-200 rounded-lg p-6">
               <h3 className="font-semibold text-blue-900 mb-4">Processing Summary</h3>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
                 <div>
                   <div className="text-2xl font-bold text-blue-600">{results.chunks_created}</div>
                   <div className="text-sm text-gray-600">Chunks Created</div>
@@ -1164,14 +1438,27 @@ const pollProcessingStatus = () => {
                   <div className="text-sm text-gray-600">Passed Filters</div>
                 </div>
                 <div>
-                  <div className="text-2xl font-bold text-purple-600">{retentionRate}%</div>
-                  <div className="text-sm text-gray-600">Retention Rate</div>
+                  <div className="text-2xl font-bold text-emerald-600">{results.chunks_manually_approved || 0}</div>
+                  <div className="text-sm text-gray-600">Manually Approved</div>
+                </div>
+                <div>
+                  <div className="text-2xl font-bold text-red-600">{results.chunks_manually_rejected || 0}</div>
+                  <div className="text-sm text-gray-600">Manually Rejected</div>
                 </div>
                 <div>
                   <div className="text-2xl font-bold text-indigo-600">{usableMinutes}m</div>
                   <div className="text-sm text-gray-600">Usable Duration</div>
                 </div>
               </div>
+              
+              {results.chunks_manually_rejected > 0 && (
+                <div className="mt-4 p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+                  <p className="text-sm text-yellow-800">
+                    ⚠️ You manually rejected {results.chunks_manually_rejected} chunk(s) during review. 
+                    Final count: <span className="font-bold">{results.chunks_manually_approved}</span> chunks will be included in the dataset.
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* Quality Metrics */}

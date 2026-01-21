@@ -382,7 +382,8 @@ def get_next_video():
                 pv.duration_seconds,
                 pv.speaker_id,
                 pv.speaker_name,
-                pv.domain,
+                pv.speaker_domain,
+                pv.video_domain,
                 pv.times_rejected,
                 pv.times_processed,
                 pv.queued_at
@@ -437,7 +438,8 @@ def get_short_videos():
                 pv.duration_seconds,
                 pv.speaker_id,
                 pv.speaker_name,
-                pv.domain
+                pv.speaker_domain,
+                pv.video_domain
             FROM pending_videos_queue pv
             WHERE pv.duration_seconds > 0 
             AND pv.duration_seconds <= %s
@@ -513,6 +515,57 @@ def claim_video(video_id):
             'job_id': result['job_id'],
             'video_id': result['video_id'],
             'preset': preset
+        })
+        
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/videos/<video_id>/update-domain', methods=['POST'])
+def update_video_domain(video_id):
+    """Update video domain"""
+    if 'student_id' not in session:
+        return jsonify({'error': 'Not logged in'}), 401
+    
+    data = request.json
+    domain = data.get('domain')
+    
+    # Valid domains
+    valid_domains = [
+        'food_blogger', 'academician', 'economic', 'financial',
+        'motivational_speaker', 'comedian', 'sports_and_gaming', 'general', 'other'
+    ]
+    
+    if domain not in valid_domains:
+        return jsonify({'error': f'Invalid domain. Must be one of: {", ".join(valid_domains)}'}), 400
+    
+    conn = get_db()
+    cur = conn.cursor()
+    
+    try:
+        # Update video domain
+        cur.execute("""
+            UPDATE videos
+            SET domain = %s::domain_type
+            WHERE video_id = %s
+            RETURNING video_id, domain
+        """, (domain, video_id))
+        
+        result = cur.fetchone()
+        
+        if not result:
+            conn.rollback()
+            return jsonify({'error': 'Video not found'}), 404
+        
+        conn.commit()
+        
+        return jsonify({
+            'message': 'Video domain updated successfully',
+            'video_id': result['video_id'],
+            'domain': result['domain']
         })
         
     except Exception as e:
@@ -1192,17 +1245,46 @@ def get_video_chunks(video_id):
         return jsonify({'error': 'Not logged in'}), 401
     
     try:
-        # Get storage path from processing status or database
+        # Get storage path from processing status or check outputs/storage directories
         storage_path = None
         if video_id in processing_status and processing_status[video_id].get('results'):
             storage_path = processing_status[video_id]['results'].get('storage_path')
         
+        # If not in processing_status, check outputs and storage directories
         if not storage_path:
-            return jsonify({'error': 'No processed chunks found'}), 404
+            script_dir = Path(__file__).parent.parent
+            outputs_dir = script_dir / 'data' / 'outputs'
+            storage_dir = script_dir / 'data' / 'storage'
+            
+            possible_paths = [
+                # Storage directory (after upload_to_storage)
+                storage_dir / video_id / video_id,
+                storage_dir / video_id,
+                # Outputs directory (before upload)
+                outputs_dir / video_id / video_id,
+                outputs_dir / video_id,
+            ]
+            for path in possible_paths:
+                if path.exists():
+                    storage_path = str(path)
+                    logger.info(f"Found chunks at: {path}")
+                    break
         
-        # Build chunk information
+        if not storage_path:
+            logger.warning(f"No processed chunks found for {video_id}")
+            return jsonify({'error': 'No processed chunks found', 'video_id': video_id}), 404
+        
+        # Build chunk information - handle both absolute and relative paths
         storage_dir = Path(storage_path)
+        if not storage_dir.is_absolute():
+            # If relative, make it absolute from script_dir
+            script_dir = Path(__file__).parent.parent
+            storage_dir = script_dir / storage_path
+        
+        logger.info(f"Resolved storage path: {storage_dir}")
         chunks = []
+        
+        logger.info(f"Looking for chunks in: {storage_dir}")
         
         # Look for video files in video_normal directory
         video_normal_dir = storage_dir / 'video_normal'
@@ -1210,25 +1292,35 @@ def get_video_chunks(video_id):
             for video_file in sorted(video_normal_dir.glob('*.mp4')):
                 chunk_name = video_file.stem
                 
-                # Build chunk info
+                # Build chunk info with correct URLs
                 chunk_info = {
                     'chunk_id': chunk_name,
-                    'video_url': f'/storage/{video_id}/{video_file.name}',
+                    'video_url': f'/api/storage/{video_id}/normal/{video_file.name}',
+                    'cropped_url': f'/api/storage/{video_id}/cropped/{chunk_name}.mp4',
+                    'bbox_url': f'/api/storage/{video_id}/bbox/{chunk_name}_with_bboxes.mp4',
+                    'audio_url': f'/api/storage/{video_id}/audio/{chunk_name}.wav',
                     'has_audio': (storage_dir / 'audio' / f'{chunk_name}.wav').exists(),
                     'has_cropped': (storage_dir / 'video_cropped' / f'{chunk_name}.mp4').exists(),
                     'has_bbox': (storage_dir / 'video_bbox' / f'{chunk_name}_with_bboxes.mp4').exists(),
                 }
                 
                 # Check for transcription
-                transcription_file = storage_dir / 'google_transcription' / f'{chunk_name}.txt'
-                if transcription_file.exists():
-                    try:
-                        with open(transcription_file, 'r', encoding='utf-8') as f:
-                            chunk_info['transcription'] = f.read().strip()
-                    except Exception:
-                        chunk_info['transcription'] = None
+                for trans_dir_name in ['google_transcription', 'whisper_transcription']:
+                    transcription_file = storage_dir / trans_dir_name / f'{chunk_name}.txt'
+                    if transcription_file.exists():
+                        try:
+                            with open(transcription_file, 'r', encoding='utf-8') as f:
+                                chunk_info['transcription'] = f.read().strip()
+                                break
+                        except Exception:
+                            pass
+                
+                if 'transcription' not in chunk_info:
+                    chunk_info['transcription'] = None
                 
                 chunks.append(chunk_info)
+        
+        logger.info(f"Found {len(chunks)} chunks for {video_id}")
         
         return jsonify({
             'chunks': chunks,
@@ -1244,12 +1336,49 @@ def get_video_chunks(video_id):
 # STATIC FILE SERVING
 # ============================================================================
 
-@app.route('/storage/<video_id>/<filename>')
-def serve_storage_file(video_id, filename):
+@app.route('/api/storage/<video_id>/<file_type>/<filename>')
+def serve_storage_file(video_id, file_type, filename):
     """Serve storage files (videos, audio) for chunk review"""
     try:
-        storage_dir = STORAGE_PATH / video_id / 'video_normal'
-        return send_from_directory(storage_dir, filename)
+        script_dir = Path(__file__).parent.parent
+        outputs_dir = script_dir / 'data' / 'outputs'
+        storage_dir = script_dir / 'data' / 'storage'
+        
+        # Find video directory - check storage first, then outputs
+        possible_paths = [
+            storage_dir / video_id / video_id,
+            storage_dir / video_id,
+            outputs_dir / video_id / video_id,
+            outputs_dir / video_id,
+        ]
+        
+        video_dir = None
+        for path in possible_paths:
+            if path.exists():
+                video_dir = path
+                break
+        
+        if not video_dir:
+            return jsonify({'error': 'Video directory not found'}), 404
+        
+        # Map file type to directory
+        type_to_dir = {
+            'normal': 'video_normal',
+            'cropped': 'video_cropped',
+            'bbox': 'video_bbox',
+            'audio': 'audio'
+        }
+        
+        if file_type not in type_to_dir:
+            return jsonify({'error': 'Invalid file type'}), 400
+        
+        file_dir = video_dir / type_to_dir[file_type]
+        
+        if not file_dir.exists():
+            return jsonify({'error': f'{file_type} directory not found'}), 404
+        
+        return send_from_directory(file_dir, filename)
+        
     except Exception as e:
         logger.error(f"Error serving file: {e}")
         return jsonify({'error': 'File not found'}), 404

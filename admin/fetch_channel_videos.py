@@ -133,7 +133,7 @@ def get_channel_videos(channel_id, max_results=50):
     
     return videos
 
-def add_videos_to_db(speaker_id, videos):
+def add_videos_to_db(speaker_id, videos, speaker_domain=None):
     """Add videos to database and create processing jobs"""
     conn = get_db()
     cur = conn.cursor()
@@ -143,17 +143,21 @@ def add_videos_to_db(speaker_id, videos):
     
     for video in videos:
         try:
+            # Use video-specific domain if provided, otherwise use speaker's domain
+            video_domain = video.get('domain', speaker_domain)
+            
             # Add video with all metadata
             cur.execute("""
                 INSERT INTO videos 
                 (video_id, youtube_url, speaker_id, title, description, 
-                 duration_seconds, upload_date, thumbnail_url)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                 duration_seconds, upload_date, thumbnail_url, domain)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (video_id) DO UPDATE SET
                     title = EXCLUDED.title,
                     description = EXCLUDED.description,
                     duration_seconds = EXCLUDED.duration_seconds,
-                    thumbnail_url = EXCLUDED.thumbnail_url
+                    thumbnail_url = EXCLUDED.thumbnail_url,
+                    domain = EXCLUDED.domain
                 RETURNING video_id
             """, (
                 video['video_id'],
@@ -163,7 +167,8 @@ def add_videos_to_db(speaker_id, videos):
                 video.get('description', ''),
                 video.get('duration_seconds', 0),
                 video['upload_date'],
-                video.get('thumbnail_url', '')
+                video.get('thumbnail_url', ''),
+                video_domain
             ))
             
             if cur.fetchone():
@@ -221,8 +226,8 @@ def populate_videos_for_speaker(speaker_id, max_videos=20):
     print(f"Found {len(videos)} videos")
     
     if videos:
-        # Add to database
-        added, skipped = add_videos_to_db(speaker_id, videos)
+        # Add to database with speaker's domain as default
+        added, skipped = add_videos_to_db(speaker_id, videos, domain)
         print(f"Added {added} new videos, skipped {skipped} duplicates")
     
     cur.close()
@@ -254,7 +259,7 @@ def populate_videos_for_all_speakers(max_videos_per_speaker=20):
         videos = get_channel_videos(channel_id, max_videos_per_speaker)
         
         if videos:
-            added, skipped = add_videos_to_db(speaker_id, videos)
+            added, skipped = add_videos_to_db(speaker_id, videos, domain)
             total_added += added
             total_skipped += skipped
             print(f"  ✓ Added {added} videos")
@@ -297,7 +302,7 @@ def populate_by_domain(domain, max_videos_per_speaker=20):
         videos = get_channel_videos(channel_id, max_videos_per_speaker)
         
         if videos:
-            added, skipped = add_videos_to_db(speaker_id, videos)
+            added, skipped = add_videos_to_db(speaker_id, videos, domain)
             total_added += added
             print(f"  Added {added} videos")
     

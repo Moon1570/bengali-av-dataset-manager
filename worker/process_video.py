@@ -355,12 +355,17 @@ def main(video_id, youtube_url, preset='balanced', transcription_model='google')
         logger.info("Step 3/4: Collecting results...")
         results, local_path = collect_results(video_id)
         
-        # Step 4: Upload
+        # Step 4: Upload (optional - files already in outputs)
         logger.info("Step 4/4: Uploading to storage...")
-        storage_path = upload_to_storage(video_id, local_path)
-        results['storage_path'] = storage_path
+        try:
+            storage_path = upload_to_storage(video_id, local_path)
+            results['storage_path'] = storage_path
+        except Exception as e:
+            logger.warning(f"Storage upload failed: {e}, using local path")
+            results['storage_path'] = str(local_path)
         
         logger.info(f"✅ Processing complete: {video_id}")
+        logger.info(f"   Results path: {results['storage_path']}")
         return results
         
     except Exception as e:
